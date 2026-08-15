@@ -1,168 +1,166 @@
-#!/usr/bin/env python3
-"""
-ComfyUI形式のAnima LoRA → diffusers形式に変換するスクリプト
+from __future__ import annotations
 
-対応フォーマット:
-  [標準LoRA]  lora_down.weight / lora_up.weight  → lora_A / lora_B
-  [LoKr+DoRA] lokr_w1 / lokr_w2_a / lokr_w2_b   → Kronecker積展開 → SVD → lora_A / lora_B
-
-キー変換規則:
-  lora_unet_blocks_{N}_{sublayer}.* → diffusion_model.blocks.{N}.{sublayer}.*
-"""
-import sys
-from collections import defaultdict
+import argparse
+import re
 from pathlib import Path
 
 import torch
 from safetensors.torch import load_file, save_file
 
-LOKR_RANK = 32  # LoKr → LoRA 変換時のランク
+LOKR_RANK = 32
 
-KNOWN_SUFFIXES = {
-    "lora_down.weight": "lora_down",
-    "lora_up.weight":   "lora_up",
-    "alpha":            "alpha",
-    "lokr_w1":          "lokr_w1",
-    "lokr_w2_a":        "lokr_w2_a",
-    "lokr_w2_b":        "lokr_w2_b",
-    "dora_scale":       "dora_scale",
-}
-
-SUBLAYER_MAP = {
-    "cross_attn_k_proj":              "cross_attn.k_proj",
-    "cross_attn_output_proj":         "cross_attn.output_proj",
-    "cross_attn_q_proj":              "cross_attn.q_proj",
-    "cross_attn_v_proj":              "cross_attn.v_proj",
-    "mlp_layer1":                     "mlp.layer1",
-    "mlp_layer2":                     "mlp.layer2",
-    "self_attn_k_proj":               "self_attn.k_proj",
-    "self_attn_output_proj":          "self_attn.output_proj",
-    "self_attn_q_proj":               "self_attn.q_proj",
-    "self_attn_v_proj":               "self_attn.v_proj",
-    "adaln_modulation_cross_attn_1":  "adaln_modulation_cross_attn.1",
-    "adaln_modulation_cross_attn_2":  "adaln_modulation_cross_attn.2",
-    "adaln_modulation_mlp_1":         "adaln_modulation_mlp.1",
-    "adaln_modulation_mlp_2":         "adaln_modulation_mlp.2",
-    "adaln_modulation_self_attn_1":   "adaln_modulation_self_attn.1",
-    "adaln_modulation_self_attn_2":   "adaln_modulation_self_attn.2",
-}
+COMFY_WEIGHT_RE = re.compile(
+    r"^lora_unet_blocks_(?P<block>\d+)_(?P<layer>.+)\.(?P<direction>lora_down|lora_up)\.weight$"
+)
+COMFY_ALPHA_RE = re.compile(r"^lora_unet_blocks_(?P<block>\d+)_(?P<layer>.+)\.alpha$")
+LOKR_PART_RE = re.compile(
+    r"^(?P<base>.+)\.(?P<part>lokr_w1|lokr_w2|lokr_w2_a|lokr_w2_b|dora_scale|alpha)$"
+)
 
 
-def parse_base_key(comfy_base: str):
-    """lora_unet_blocks_{N}_{sublayer} を (block_num, anima_sublayer) に分解。失敗時は None。"""
-    if not comfy_base.startswith("lora_unet_blocks_"):
-        return None
-    rest = comfy_base[len("lora_unet_blocks_"):]
-    idx = rest.find("_")
-    if idx == -1:
-        return None
-    block_num = rest[:idx]
-    sublayer_str = rest[idx + 1:]
-    anima_sublayer = SUBLAYER_MAP.get(sublayer_str)
-    if anima_sublayer is None:
-        return None
-    return block_num, anima_sublayer
+def default_output_path(input_path: str | Path) -> Path:
+    input_path = Path(input_path)
+    return input_path.with_name(f"{input_path.stem}_diffusers{input_path.suffix}")
 
 
-def lokr_to_lora(w1: torch.Tensor, w2_a: torch.Tensor, w2_b: torch.Tensor, rank: int):
-    """
-    LoKr → 標準LoRA 変換
-      W_delta = kron(w1, w2_a @ w2_b)
-      W_delta ≈ lora_B @ lora_A  (rank-r SVD近似)
-    戻り値: (lora_A, lora_B)  ※ lora_A: (r, in), lora_B: (out, r)
-    """
-    w2 = w2_a.float() @ w2_b.float()
-    W = torch.kron(w1.float(), w2)          # (out, in)
-    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-    r = min(rank, S.shape[0])
-    scale = S[:r].sqrt()
-    lora_B = (U[:, :r] * scale).to(w1.dtype)   # (out, r)
-    lora_A = (Vh[:r, :] * scale.unsqueeze(1)).to(w1.dtype)  # (r, in)
-    return lora_A, lora_B
+def convert_base_name(name: str) -> str:
+    if name.startswith("diffusion_model."):
+        return name
+
+    match = re.match(r"^lora_unet_blocks_(?P<block>\d+)_(?P<layer>.+)$", name)
+    if not match:
+        raise ValueError(f"Unsupported Anima adapter key base: {name}")
+
+    return f"diffusion_model.blocks.{match.group('block')}.{match.group('layer')}"
 
 
-def convert_lora(input_path: str, output_path: str):
-    print(f"入力: {input_path}")
-    state = load_file(input_path)
+def convert_comfyui_entry(key: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor] | None:
+    weight_match = COMFY_WEIGHT_RE.match(key)
+    if weight_match:
+        suffix = "lora_A.weight" if weight_match.group("direction") == "lora_down" else "lora_B.weight"
+        target = (
+            f"diffusion_model.blocks.{weight_match.group('block')}."
+            f"{weight_match.group('layer')}.{suffix}"
+        )
+        return target, tensor
 
-    # diffusers形式か判定（キーが diffusion_model. で始まる場合はすでに変換済み）
-    if any(k.startswith("diffusion_model.") for k in state.keys()):
-        print("このLoRAはすでにdiffusers形式です。そのままコピーします。")
-        save_file(dict(state), output_path)
-        print(f"保存完了: {output_path}")
-        return
+    alpha_match = COMFY_ALPHA_RE.match(key)
+    if alpha_match:
+        target = (
+            f"diffusion_model.blocks.{alpha_match.group('block')}."
+            f"{alpha_match.group('layer')}.lora_alpha"
+        )
+        return target, tensor
 
-    # キーをベースキーでグループ化（既知サフィックスで正確に分割）
-    groups = defaultdict(dict)
-    ungrouped = []
-    for key, tensor in state.items():
-        matched = False
-        for full_suffix, short_name in KNOWN_SUFFIXES.items():
-            if key.endswith("." + full_suffix):
-                base = key[: -(len(full_suffix) + 1)]
-                groups[base][short_name] = tensor
-                matched = True
-                break
-        if not matched:
-            ungrouped.append(key)
+    return None
 
-    converted = {}
-    skipped_bases = []
 
-    for base, tensors in groups.items():
-        parsed = parse_base_key(base)
-        if parsed is None:
-            skipped_bases.append(base)
+def _prepare_matrix(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim != 2:
+        raise ValueError(f"Expected a 2D matrix for LoKr conversion, got shape {tuple(tensor.shape)}")
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        return tensor.to(torch.float32)
+    return tensor
+
+
+def convert_lokr_group(
+    base_name: str, group: dict[str, torch.Tensor], lokr_rank: int = LOKR_RANK
+) -> dict[str, torch.Tensor]:
+    if "lokr_w1" not in group:
+        raise ValueError(f"Missing lokr_w1 for {base_name}")
+
+    if "lokr_w2" in group:
+        w2 = group["lokr_w2"]
+    elif "lokr_w2_a" in group and "lokr_w2_b" in group:
+        w2 = _prepare_matrix(group["lokr_w2_a"]) @ _prepare_matrix(group["lokr_w2_b"])
+    else:
+        raise ValueError(f"Missing lokr_w2 or lokr_w2_a/lokr_w2_b for {base_name}")
+
+    w1 = _prepare_matrix(group["lokr_w1"])
+    w2 = _prepare_matrix(w2)
+    full_matrix = torch.kron(w1, w2)
+
+    u, singular_values, vh = torch.linalg.svd(full_matrix, full_matrices=False)
+    rank = min(lokr_rank, singular_values.shape[0], full_matrix.shape[0], full_matrix.shape[1])
+    sqrt_s = singular_values[:rank].sqrt()
+
+    lora_b = (u[:, :rank] * sqrt_s.unsqueeze(0)).to(group["lokr_w1"].dtype)
+    lora_a = (sqrt_s.unsqueeze(1) * vh[:rank, :]).to(group["lokr_w1"].dtype)
+
+    alpha = group.get("alpha")
+    if alpha is None:
+        alpha = torch.tensor(float(rank), dtype=group["lokr_w1"].dtype)
+
+    target_base = convert_base_name(base_name)
+    return {
+        f"{target_base}.lora_A.weight": lora_a,
+        f"{target_base}.lora_B.weight": lora_b,
+        f"{target_base}.lora_alpha": alpha,
+    }
+
+
+def convert_state_dict(
+    state_dict: dict[str, torch.Tensor], lokr_rank: int = LOKR_RANK
+) -> dict[str, torch.Tensor]:
+    converted: dict[str, torch.Tensor] = {}
+    consumed: set[str] = set()
+    lokr_groups: dict[str, dict[str, torch.Tensor]] = {}
+
+    for key, tensor in state_dict.items():
+        match = LOKR_PART_RE.match(key)
+        if match:
+            lokr_groups.setdefault(match.group("base"), {})[match.group("part")] = tensor
+
+    for base_name, group in lokr_groups.items():
+        if not any(part.startswith("lokr_") for part in group):
             continue
-        block_num, anima_sublayer = parsed
-        prefix = f"diffusion_model.blocks.{block_num}.{anima_sublayer}"
+        converted.update(convert_lokr_group(base_name, group, lokr_rank=lokr_rank))
+        consumed.update(f"{base_name}.{part}" for part in group)
 
-        # --- LoKr + DoRA 形式 ---
-        if "lokr_w1" in tensors:
-            w1   = tensors["lokr_w1"]
-            w2_a = tensors.get("lokr_w2_a")
-            w2_b = tensors.get("lokr_w2_b")
-            if w2_a is None or w2_b is None:
-                skipped_bases.append(base)
-                continue
-            lora_A, lora_B = lokr_to_lora(w1, w2_a, w2_b, LOKR_RANK)
-            converted[f"{prefix}.lora_A.weight"] = lora_A
-            converted[f"{prefix}.lora_B.weight"] = lora_B
-            converted[f"{prefix}.lora_alpha"] = torch.tensor(float(LOKR_RANK))
-            # dora_scale は近似として無視（ベースモデル重みが無いため厳密な適用不可）
+    unsupported: list[str] = []
+    for key, tensor in state_dict.items():
+        if key in consumed:
+            continue
+        if key.startswith("diffusion_model."):
+            converted[key] = tensor
+            continue
 
-        # --- 標準LoRA 形式 ---
-        elif "lora_down" in tensors and "lora_up" in tensors:
-            converted[f"{prefix}.lora_A.weight"] = tensors["lora_down"]
-            converted[f"{prefix}.lora_B.weight"] = tensors["lora_up"]
-            if "alpha" in tensors:
-                converted[f"{prefix}.lora_alpha"] = tensors["alpha"]
+        converted_entry = convert_comfyui_entry(key, tensor)
+        if converted_entry is None:
+            unsupported.append(key)
+            continue
 
-        else:
-            skipped_bases.append(base)
+        target_key, target_tensor = converted_entry
+        converted[target_key] = target_tensor
 
-    total_in  = len(groups)
-    total_out = len([k for k in converted if k.endswith(".lora_A.weight")])
-    if ungrouped:
-        print(f"未認識キー ({len(ungrouped)}): {ungrouped[:3]} ...")
-    print(f"変換成功: {total_out} レイヤー / {total_in} レイヤー")
-    if skipped_bases:
-        print(f"スキップ ({len(skipped_bases)} レイヤー): {skipped_bases[:3]} ...")
+    if unsupported:
+        raise ValueError(f"Unsupported adapter keys: {', '.join(sorted(unsupported))}")
 
-    if not converted:
-        print("ERROR: 変換できたキーが0件です。")
-        sys.exit(1)
+    return converted
 
-    save_file(converted, output_path)
-    print(f"保存完了: {output_path}")
+
+def convert_file(input_path: str | Path, output_path: str | Path | None = None) -> Path:
+    input_path = Path(input_path)
+    output_path = Path(output_path) if output_path is not None else default_output_path(input_path)
+
+    state_dict = load_file(str(input_path))
+    converted = convert_state_dict(state_dict)
+    save_file(converted, str(output_path))
+    return output_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Convert CivitAI Anima LoRA safetensors into diffusers-compatible format."
+    )
+    parser.add_argument("input_path", help="Input safetensors path")
+    parser.add_argument("output_path", nargs="?", help="Output safetensors path")
+    args = parser.parse_args()
+
+    output_path = convert_file(args.input_path, args.output_path)
+    print(f"Saved converted LoRA to {output_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("使用方法: python convert_anima_lora.py <input.safetensors> [output.safetensors]")
-        sys.exit(1)
-
-    inp = sys.argv[1]
-    stem = Path(inp).stem
-    out = sys.argv[2] if len(sys.argv) >= 3 else f"{stem}_diffusers.safetensors"
-    convert_lora(inp, out)
+    raise SystemExit(main())
